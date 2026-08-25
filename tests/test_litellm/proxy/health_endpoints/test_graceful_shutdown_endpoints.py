@@ -76,15 +76,46 @@ def test_drain_disabled_ignores_token_header(client, monkeypatch):
     assert GracefulShutdownManager.is_shutting_down() is False
 
 
-def test_drain_when_enabled_without_token_sets_shutting_down_and_returns_drained(
-    client, enable_drain
-):
+def test_drain_when_enabled_without_token_fails_closed(client, enable_drain):
+    """A missing token must deny the drain instead of authorizing it (#35527)."""
+    resp = client.get("/health/drain")
+    assert resp.status_code == 401
+    assert "drain_endpoint_token" in resp.json()["detail"]
+    assert GracefulShutdownManager.is_shutting_down() is False
+
+
+def test_drain_without_token_allowed_via_explicit_anonymous_opt_in(client, monkeypatch):
+    """Operators can restore unauthenticated draining with an explicit flag."""
+    from litellm.proxy import proxy_server
+
+    monkeypatch.setattr(
+        proxy_server,
+        "general_settings",
+        {"enable_drain_endpoint": True, "allow_anonymous_drain": True},
+    )
     resp = client.get("/health/drain")
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "drained"
-    assert body["drained_requests"] == 0
+    assert resp.json()["status"] == "drained"
     assert GracefulShutdownManager.is_shutting_down() is True
+
+
+def test_drain_anonymous_opt_in_ignored_when_token_configured(client, monkeypatch):
+    """A configured token must still be enforced even when anonymous draining
+    is opted into."""
+    from litellm.proxy import proxy_server
+
+    monkeypatch.setattr(
+        proxy_server,
+        "general_settings",
+        {
+            "enable_drain_endpoint": True,
+            "allow_anonymous_drain": True,
+            "drain_endpoint_token": "secret-123",
+        },
+    )
+    resp = client.get("/health/drain")
+    assert resp.status_code == 401
+    assert GracefulShutdownManager.is_shutting_down() is False
 
 
 def test_drain_with_token_configured_rejects_missing_header(

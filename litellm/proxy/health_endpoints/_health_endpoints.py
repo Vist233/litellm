@@ -1589,17 +1589,44 @@ def _drain_endpoint_token() -> str | None:
     return None
 
 
+def _drain_endpoint_allows_anonymous() -> bool:
+    """
+    Explicit opt-in to keep ``/health/drain`` callable without a token.
+
+    Draining is process-wide and irreversible until restart, so the default is
+    fail-closed when no token is configured (#35527). Operators in fully
+    controlled environments (e.g. an isolated preStop network) can restore the
+    legacy unauthenticated behaviour with ``allow_anonymous_drain: true``.
+    """
+    from litellm.proxy.proxy_server import general_settings
+
+    return general_settings.get("allow_anonymous_drain") is True
+
+
 def _authorize_drain_request(request: Request) -> None:
     """
     Reject /health/drain calls that don't carry the configured X-Drain-Token.
 
-    When no token is configured the endpoint is treated as already opted-in
-    (the ``enable_drain_endpoint`` flag is the only gate). Comparison uses
-    ``secrets.compare_digest`` to avoid timing leaks.
+    Fails closed when no token is configured: the request gets a 401 unless
+    the operator explicitly opts back into unauthenticated draining with
+    ``allow_anonymous_drain: true`` (#35527). Treating a missing secret as
+    authorization let any caller able to reach the health port trigger a
+    process-wide shutdown. Comparison uses ``secrets.compare_digest`` to
+    avoid timing leaks.
     """
     expected: Final = _drain_endpoint_token()
     if expected is None:
-        return
+        if _drain_endpoint_allows_anonymous():
+            return
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "No drain token is configured. Set general_settings.drain_endpoint_token "
+                "or the DRAIN_ENDPOINT_TOKEN env var and send it as X-Drain-Token, "
+                "or set general_settings.allow_anonymous_drain to true to allow "
+                "unauthenticated draining."
+            ),
+        )
     supplied: Final = request.headers.get("x-drain-token") or ""
     if not secrets.compare_digest(supplied, expected):
         raise HTTPException(
@@ -1696,7 +1723,10 @@ async def health_drain(request: Request):
     ``general_settings.drain_endpoint_token`` (or the ``DRAIN_ENDPOINT_TOKEN``
     env var) and supply the same value on the ``X-Drain-Token`` header from
     the preStop hook. Calls without the header (or with a wrong value) get a
-    401 and have no side effect.
+    401 and have no side effect. When no token is configured the endpoint
+    fails closed with a 401; set ``general_settings.allow_anonymous_drain:
+    true`` only if the health port is reachable from trusted callers and you
+    need the legacy unauthenticated behaviour.
 
     When enabled, it marks the worker as shutting down (so /health/readiness
     and /health/liveliness immediately start returning 503, removing the pod
