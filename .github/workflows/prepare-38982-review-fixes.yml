@@ -1,0 +1,162 @@
+name: Prepare 38982 review fixes
+
+on:
+  push:
+    branches:
+      - ci_38982_review_fixes
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-publish:
+    if: github.event.head_commit.message == 'ci: validate 38982 review fixes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: ./.github/actions/setup-uv-with-retries
+        with:
+          version: "0.10.9"
+
+      - name: Apply review fixes in worktree
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          common_path = Path("litellm/router_utils/common_utils.py")
+          common = common_path.read_text()
+          old_helper = '''def _is_server_tool_type(tool: object, family: str) -> bool:\n    if not isinstance(tool, Mapping):\n        return False\n    tool_type: Final = tool.get("type")\n    return isinstance(tool_type, str) and (tool_type == family or tool_type.startswith(f"{family}_"))\n'''
+          new_helper = '''def _is_server_tool_type(tool: object, family: str) -> bool:\n    if not isinstance(tool, Mapping):\n        return False\n    tool_type: Final = tool.get("type")\n    if not isinstance(tool_type, str):\n        return False\n    if tool_type == family:\n        return True\n    if family == "web_search" and tool_type == "web_search_preview":\n        return True\n    prefix: Final = f"{family}_"\n    version_suffix: Final = tool_type[len(prefix) :] if tool_type.startswith(prefix) else ""\n    return bool(version_suffix) and version_suffix.isdigit()\n'''
+          if common.count(old_helper) != 1:
+              raise SystemExit("unexpected _is_server_tool_type source")
+          common_path.write_text(common.replace(old_helper, new_helper, 1))
+
+          router_path = Path("litellm/router.py")
+          router = router_path.read_text()
+          sync_start = router.index("    def get_available_deployment(\n")
+          sync_end = router.index("\n    def ", sync_start + 10)
+          sync = router[sync_start:sync_end]
+          common_call = '''        model, healthy_deployments = self._common_checks_available_deployment(\n            model=model,\n            messages=messages,\n            input=input,\n            specific_deployment=specific_deployment,\n            request_kwargs=request_kwargs,\n        )\n'''
+          if sync.count(common_call) != 1:
+              raise SystemExit("unexpected sync get_available_deployment common-check call")
+          filter_block = '''\n        web_capable_deployments: Final = filter_web_search_deployments(\n            healthy_deployments=healthy_deployments,\n            request_kwargs=request_kwargs,\n        )\n'''
+          sync = sync.replace(common_call, common_call + filter_block, 1)
+          if sync.count("        if isinstance(healthy_deployments, dict):") != 1:
+              raise SystemExit("unexpected sync dict passthrough block")
+          sync = sync.replace(
+              "        if isinstance(healthy_deployments, dict):",
+              "        if isinstance(web_capable_deployments, dict):",
+              1,
+          )
+          sync = sync.replace(
+              '''            if (healthy_deployments.get("model_info") or {}).get("blocked") is True:\n''',
+              '''            if (web_capable_deployments.get("model_info") or {}).get("blocked") is True:\n''',
+              1,
+          )
+          sync = sync.replace("            return healthy_deployments\n", "            return web_capable_deployments\n", 1)
+          health_call = '''        healthy_deployments = self._filter_health_check_unhealthy_deployments(\n            healthy_deployments=healthy_deployments,\n'''
+          if sync.count(health_call) != 1:
+              raise SystemExit("unexpected sync health-filter call")
+          sync = sync.replace(
+              health_call,
+              '''        healthy_deployments = self._filter_health_check_unhealthy_deployments(\n            healthy_deployments=web_capable_deployments,\n''',
+              1,
+          )
+          router_path.write_text(router[:sync_start] + sync + router[sync_end:])
+
+          test_path = Path("tests/test_litellm/router_utils/test_router_utils_common_utils.py")
+          tests = test_path.read_text()
+          tests = tests.replace(
+              "from typing import Dict, List, Optional, Union",
+              "from typing import Dict, Final, List, Optional, Union",
+              1,
+          )
+          import_anchor = "from litellm.router_utils.common_utils import (\n"
+          if "from litellm.types.router import RouterRateLimitError\n" not in tests:
+              tests = tests.replace(
+                  import_anchor,
+                  "from litellm.types.router import RouterRateLimitError\n" + import_anchor,
+                  1,
+              )
+          section_start = tests.index("    def test_anthropic_versioned_web_search_filters_unsupported")
+          section_end = tests.index("\n\ndef test_invalidate_model_group_info_cache", section_start)
+          new_tests = '''    def test_anthropic_versioned_web_search_filters_unsupported(self, sample_deployments):\n        \"\"\"Anthropic versioned web-search types filter unsupported deployments.\"\"\"\n        request_kwargs: Final = {\"tools\": [{\"type\": \"web_search_20250305\", \"name\": \"web_search\"}]}\n        result: Final = filter_web_search_deployments(sample_deployments, request_kwargs)\n        assert isinstance(result, list)\n        result_ids: Final = tuple(d[\"model_info\"][\"id\"] for d in result)\n        assert \"deployment-3\" not in result_ids\n\n    def test_anthropic_web_fetch_filters_unsupported(self):\n        \"\"\"Anthropic versioned web-fetch types filter unsupported deployments.\"\"\"\n        deployments: Final = [\n            {\"model_info\": {\"id\": \"d1\", \"supports_web_fetch\": True}},\n            {\"model_info\": {\"id\": \"d2\", \"supports_web_fetch\": False}},\n        ]\n        request_kwargs: Final = {\"tools\": [{\"type\": \"web_fetch_20250910\", \"name\": \"web_fetch\"}]}\n        result: Final = filter_web_search_deployments(deployments, request_kwargs)\n        assert isinstance(result, list)\n        assert tuple(d[\"model_info\"][\"id\"] for d in result) == (\"d1\",)\n\n    def test_future_numeric_web_tool_versions_filter_unsupported(self):\n        \"\"\"Future numeric native-tool versions stay inside the same capability family.\"\"\"\n        deployments: Final = [\n            {\n                \"model_info\": {\n                    \"id\": \"supported\",\n                    \"supports_web_search\": True,\n                    \"supports_web_fetch\": True,\n                }\n            },\n            {\n                \"model_info\": {\n                    \"id\": \"unsupported\",\n                    \"supports_web_search\": False,\n                    \"supports_web_fetch\": False,\n                }\n            },\n        ]\n        search_result: Final = filter_web_search_deployments(\n            deployments, {\"tools\": [{\"type\": \"web_search_20990101\"}]}\n        )\n        fetch_result: Final = filter_web_search_deployments(\n            deployments, {\"tools\": [{\"type\": \"web_fetch_20990101\"}]}\n        )\n        assert isinstance(search_result, list)\n        assert isinstance(fetch_result, list)\n        assert tuple(d[\"model_info\"][\"id\"] for d in search_result) == (\"supported\",)\n        assert tuple(d[\"model_info\"][\"id\"] for d in fetch_result) == (\"supported\",)\n\n    def test_custom_server_tool_prefixes_do_not_trigger_native_filtering(self):\n        \"\"\"Arbitrary suffixes are custom tool types, not native version identifiers.\"\"\"\n        deployments: Final = [\n            {\n                \"model_info\": {\n                    \"id\": \"custom-tool\",\n                    \"supports_web_search\": False,\n                    \"supports_web_fetch\": False,\n                }\n            }\n        ]\n        assert filter_web_search_deployments(\n            deployments, {\"tools\": [{\"type\": \"web_search_custom\", \"name\": \"web_search\"}]}\n        ) == deployments\n        assert filter_web_search_deployments(\n            deployments, {\"tools\": [{\"type\": \"web_fetch_notes\", \"name\": \"web_fetch\"}]}\n        ) == deployments\n\n    def test_custom_function_names_do_not_trigger_native_capability_filtering(self):\n        deployments: Final = [\n            {\n                \"model_info\": {\n                    \"id\": \"custom-function\",\n                    \"supports_web_search\": False,\n                    \"supports_web_fetch\": False,\n                }\n            }\n        ]\n        assert filter_web_search_deployments(\n            deployments, {\"tools\": [{\"type\": \"function\", \"name\": \"web_search\"}]}\n        ) == deployments\n        assert filter_web_search_deployments(\n            deployments, {\"tools\": [{\"type\": \"function\", \"name\": \"web_fetch\"}]}\n        ) == deployments\n        assert filter_web_search_deployments(\n            deployments, {\"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"web_search\"}}]}\n        ) == deployments\n        assert filter_web_search_deployments(\n            deployments, {\"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"web_fetch\"}}]}\n        ) == deployments\n\n    def test_combined_native_search_and_fetch_require_both_capabilities(self):\n        \"\"\"A request using both native tools keeps only deployments supporting both.\"\"\"\n        deployments: Final = [\n            {\n                \"model_info\": {\n                    \"id\": \"both\",\n                    \"supports_web_search\": True,\n                    \"supports_web_fetch\": True,\n                }\n            },\n            {\n                \"model_info\": {\n                    \"id\": \"search-only\",\n                    \"supports_web_search\": True,\n                    \"supports_web_fetch\": False,\n                }\n            },\n            {\n                \"model_info\": {\n                    \"id\": \"fetch-only\",\n                    \"supports_web_search\": False,\n                    \"supports_web_fetch\": True,\n                }\n            },\n        ]\n        request_kwargs: Final = {\n            \"tools\": [\n                {\"type\": \"web_search_20250305\", \"name\": \"web_search\"},\n                {\"type\": \"web_fetch_20250910\", \"name\": \"web_fetch\"},\n            ]\n        }\n        result: Final = filter_web_search_deployments(deployments, request_kwargs)\n        assert isinstance(result, list)\n        assert tuple(d[\"model_info\"][\"id\"] for d in result) == (\"both\",)\n\n    def test_sync_router_filters_native_web_fetch_capability(self):\n        \"\"\"The synchronous selector must apply the same native-tool capability filter.\"\"\"\n        router: Final = Router(\n            model_list=[\n                {\n                    \"model_name\": \"mixed-claude\",\n                    \"litellm_params\": {\"model\": \"openai/gpt-4o-mini\", \"api_key\": \"sk-test\"},\n                    \"model_info\": {\n                        \"id\": \"no-fetch\",\n                        \"supports_web_fetch\": False,\n                    },\n                }\n            ],\n            routing_strategy=\"simple-shuffle\",\n        )\n        request_kwargs: Final = {\"tools\": [{\"type\": \"web_fetch_20250910\", \"name\": \"web_fetch\"}]}\n        with pytest.raises(RouterRateLimitError):\n            router.get_available_deployment(\n                model=\"mixed-claude\",\n                messages=[{\"role\": \"user\", \"content\": \"fetch a page\"}],\n                request_kwargs=request_kwargs,\n            )\n'''
+          test_path.write_text(tests[:section_start] + new_tests + tests[section_end:])
+          PY
+
+      - name: Install dependencies
+        run: |
+          uv lock --check
+          uv sync --frozen --group proxy-dev --group e2e-dev
+          uv pip install orjson
+
+      - name: Format changed Python files
+        run: |
+          uv run --no-sync ruff format \
+            litellm/router_utils/common_utils.py \
+            litellm/router.py \
+            tests/test_litellm/router_utils/test_router_utils_common_utils.py
+
+      - name: Create local candidate commit
+        run: |
+          git config user.name "Vist233"
+          git config user.email "144699295+Vist233@users.noreply.github.com"
+          git add \
+            litellm/router_utils/common_utils.py \
+            litellm/router.py \
+            tests/test_litellm/router_utils/test_router_utils_common_utils.py
+          git diff --cached --check
+          git commit -m "fix(router): address server-tool routing review"
+          echo "GATE_BASE_SHA=31ca4ddf32ae6ed16d8518c82bd2608c248fcf5a" >> "$GITHUB_ENV"
+
+      - name: Run production Ruff
+        run: |
+          cd litellm
+          uv run --no-sync ruff check .
+
+      - name: Run test-tree Ruff
+        run: |
+          uv run --no-sync ruff check --config ruff-tests.toml tests
+
+      - name: Run strict and type-discipline gates
+        run: |
+          uv run --no-sync python scripts/ruff_strict_gate.py --base "$GATE_BASE_SHA"
+          uv run --no-sync python scripts/type_discipline_gate.py --base "$GATE_BASE_SHA"
+          uv run --no-sync python scripts/test_quality_gate.py --base "$GATE_BASE_SHA"
+
+      - name: Run focused capability tests
+        run: |
+          uv run --no-sync pytest \
+            tests/test_litellm/router_utils/test_router_utils_common_utils.py::TestFilterWebSearchDeployments \
+            -q
+
+      - name: Run full mapped router-utils tests
+        run: |
+          uv run --no-sync pytest tests/test_litellm/router_utils/test_router_utils_common_utils.py -q
+
+      - name: Publish validated code commit to PR branch
+        env:
+          EXPECTED_HEAD: e5ed2605708a36cd427a3484f5175e7d83ef25b6
+          TARGET_BRANCH: litellm_fix_38982_anthropic_server_tool_routing
+        run: |
+          git diff HEAD^ HEAD -- \
+            litellm/router_utils/common_utils.py \
+            litellm/router.py \
+            tests/test_litellm/router_utils/test_router_utils_common_utils.py \
+            > "$RUNNER_TEMP/review-fixes.patch"
+          git fetch origin "$TARGET_BRANCH"
+          test "$(git rev-parse FETCH_HEAD)" = "$EXPECTED_HEAD"
+          git checkout -B publish "$EXPECTED_HEAD"
+          git apply --index "$RUNNER_TEMP/review-fixes.patch"
+          git diff --cached --check
+          git commit -m "fix(router): address server-tool routing review"
+          git push origin HEAD:"$TARGET_BRANCH"
